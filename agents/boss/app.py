@@ -4,7 +4,6 @@ import json
 import time
 import logging
 from threading import Thread
-from psycopg2 import connect, sql
 from psycopg2.extras import RealDictCursor
 from shared.communication import send_message, format_message
 from shared.db_utils import get_db_connection, init_db
@@ -15,7 +14,7 @@ app = Flask(__name__)
 # Environment variables (set these in your environment)
 REDIS_HOST = "redis"
 POSTGRES_HOST = "postgres"
-OPENAI_API_KEY = "  # Replace with your OpenAI API key
+OPENAI_API_KEY = ""  # Replace with your OpenAI API key
 OpenAI.api_key = OPENAI_API_KEY
 
 # Redis connection
@@ -54,8 +53,7 @@ def save_project_to_db(user_id, description, tasks):
 @app.route("/talk", methods=["POST"])
 def talk_to_boss():
     """
-    Receive input from the user and dynamically generate a project plan using GPT.
-    Save the project in PostgreSQL and cache it in Redis.
+    Generate a project plan dynamically using GPT and save it to Redis and PostgreSQL.
     """
     user_input = request.json.get("message", "")
     user_id = request.json.get("user_id", "default_user")
@@ -74,46 +72,49 @@ def talk_to_boss():
         )
         project_description = response.choices[0].message.content
 
-        # Generate tasks with explicit JSON formatting instructions
+        # Generate tasks with OpenAI
         task_response = client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": """You are an experienced software architect. 
+                Create a balanced mix of frontend and backend tasks.
                 Always respond with a valid JSON array of task objects. 
-                Each task object should have these fields:
-                - "task": string describing the task
-                - "priority": number from 1-5
-                - "estimated_hours": number
-                - "dependencies": array of task numbers that must be completed first
-                Example format:
+                Each task object should have the fields: 
+                - "task": Clear task description prefixed with [Frontend] or [Backend]
+                - "priority": 1-10
+                - "estimated_hours": estimated hours
+                - "dependencies": array of task names that must be completed first
+                
+                Example:
                 [
-                    {
-                        "task": "Set up basic project structure",
-                        "priority": 1,
-                        "estimated_hours": 2,
-                        "dependencies": []
-                    },
-                    {
-                        "task": "Implement user authentication",
-                        "priority": 2,
-                        "estimated_hours": 4,
-                        "dependencies": [1]
-                    }
+                    {"task": "[Backend] Set up database schema", "priority": 1, "estimated_hours": 4, "dependencies": []},
+                    {"task": "[Frontend] Create login UI", "priority": 2, "estimated_hours": 3, "dependencies": []}
                 ]"""},
-                {"role": "user", "content": f"Generate a list of tasks for this project: {project_description}. Respond only with the JSON array, no additional text."}
+                {"role": "user", "content": f"Generate a list of tasks for this project: {project_description}. Include both frontend and backend tasks. Respond only with the JSON array."}
             ]
         )
         tasks_content = task_response.choices[0].message.content
 
-        # Parse tasks from GPT output
+        # Parse tasks
         tasks = json.loads(tasks_content)
-        for task in tasks:
+        
+        # Create a mapping of task names to IDs
+        task_name_to_id = {}
+        for idx, task in enumerate(tasks):
+            task_id = idx + 1
+            task_name_to_id[task["task"]] = task_id
             task["status"] = "pending"
+            task["task_id"] = task_id
+            
+            # Convert string dependencies to task IDs
+            if "dependencies" in task:
+                task["dependencies"] = [
+                    task_name_to_id.get(dep, dep) 
+                    for dep in task["dependencies"]
+                ]
 
-        # Save the project to PostgreSQL
+        # Save project to PostgreSQL and Redis
         project_id = save_project_to_db(user_id, project_description, tasks)
-
-        # Cache the project in Redis
         project_plan = {
             "project_id": project_id,
             "user_id": user_id,
@@ -146,26 +147,24 @@ def task_complete():
     status = data.get("status", "completed")
 
     if not project_id or not task_id:
-        return jsonify({"error": "Project ID and Task ID are required"}), 400
+        return jsonify({"error": "Project ID and Task ID are required."}), 400
 
     try:
         # Fetch project details
-        project_plan = redis_client.get(f"project:{project_id}")
+        project_plan = json.loads(redis_client.get(f"project:{project_id}"))
         if not project_plan:
-            conn = get_db_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT * FROM projects WHERE id = %s", (project_id,))
-                project_plan = cursor.fetchone()
-            if not project_plan:
-                return jsonify({"error": f"No project found with ID {project_id}."}), 404
-
-        project_plan = json.loads(project_plan)
+            raise ValueError(f"No project found with ID {project_id}.")
 
         # Update task status
-        for task in project_plan.get("tasks", []):
-            if task.get("task_id") == task_id:
+        task_found = False
+        for task in project_plan["tasks"]:
+            if task["task_id"] == task_id:
                 task["status"] = status
+                task_found = True
                 break
+
+        if not task_found:
+            raise ValueError(f"Task ID {task_id} not found in project {project_id}.")
 
         # Save updated project to Redis
         redis_client.set(f"project:{project_id}", json.dumps(project_plan))
@@ -187,40 +186,45 @@ def task_delegation_worker():
             for key in keys:
                 project_plan = json.loads(redis_client.get(key))
                 tasks = project_plan.get("tasks", [])
-                delegation_status = project_plan.get("delegation_status", [])
 
-                # Check for pending tasks
                 for task in tasks:
                     if task["status"] == "pending" and all(
-                        dep["status"] == "completed" for dep in task.get("dependencies", [])
+                        any(dep["task_id"] == dep_id and dep["status"] == "completed" 
+                            for dep in project_plan["tasks"])
+                        for dep_id in task.get("dependencies", [])
                     ):
-                        # Decide which developer to assign the task to
-                        developer = "dev_1" if "frontend" in task["task"].lower() else "dev_2"
-                        dev_channel = f"tasks:{developer}"
+                        task_lower = task["task"].lower()
+                        developer = None
+                        
+                        if "[frontend]" in task_lower:
+                            developer = "dev_1"
+                        elif "[backend]" in task_lower:
+                            developer = "dev_2"
+                        else:
+                            developer = "dev_1" if task["task_id"] % 2 == 0 else "dev_2"
 
-                        # Publish task to developer's Redis channel
+                        if task.get("developer"):
+                            continue
+
                         task["status"] = "in_progress"
-                        redis_client.publish(dev_channel, json.dumps(task))
-                        delegation_status.append({"task": task, "developer": developer, "status": "delegated"})
+                        task["developer"] = developer
+                        redis_client.publish(f"tasks:{developer}", json.dumps(task))
+                        logging.info(f"Task {task['task_id']}: {task['task']} assigned to {developer}")
 
-                # Update project plan
-                project_plan["delegation_status"] = delegation_status
                 redis_client.set(key, json.dumps(project_plan))
 
         except Exception as e:
-            logging.error(f"Task delegation worker encountered an error: {e}")
+            logging.error(f"Task delegation worker encountered an error: {str(e)}")
 
-        time.sleep(5)  # Check every 5 seconds
+        time.sleep(5)
 
 
 if __name__ == "__main__":
-    # Wait for dependencies to be ready
-    time.sleep(5)  # Allow Redis and PostgreSQL to start
+    time.sleep(5)  # Wait for services to be ready
     logging.info("Initializing database...")
     init_db()
     logging.info("Starting Boss agent...")
 
-    # Start the delegation worker
     Thread(target=task_delegation_worker, daemon=True).start()
 
     app.run(host="0.0.0.0", port=8000)
