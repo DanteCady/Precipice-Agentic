@@ -15,7 +15,7 @@ app = Flask(__name__)
 # Environment variables (set these in your environment)
 REDIS_HOST = "redis"
 POSTGRES_HOST = "postgres"
-OPENAI_API_KEY = "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"  # Replace with your OpenAI API key
+OPENAI_API_KEY = "  # Replace with your OpenAI API key
 OpenAI.api_key = OPENAI_API_KEY
 
 # Redis connection
