@@ -1,0 +1,54 @@
+version: '3.9'
+services:
+  boss:
+    build:
+      context: .
+      dockerfile: agents/boss/Dockerfile
+    ports:
+      - '8000:8000'
+    volumes:
+      - ./shared:/app/shared
+    environment:
+      - OPENAI_API_KEY=your-api-key-here
+    depends_on:
+      - postgres
+      - redis
+
+  developer-1:
+    build:
+      context: .
+      dockerfile: agents/developers/developer-1/Dockerfile
+    ports:
+      - '8001:8001'
+    volumes:
+      - ./shared:/app/shared
+
+  developer-2:
+    build:
+      context: .
+      dockerfile: agents/developers/developer-2/Dockerfile
+    ports:
+      - '8002:8002'
+    volumes:
+      - ./shared:/app/shared
+
+  redis:
+    image: 'redis:alpine'
+    ports:
+      - '6379:6379'
+    restart: always
+
+  postgres:
+    image: 'postgres:15-alpine'
+    environment:
+      POSTGRES_USER: boss
+      POSTGRES_PASSWORD: boss_password
+      POSTGRES_DB: boss_db
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:
